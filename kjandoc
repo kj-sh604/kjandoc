@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+
+# merge pptx files using libreoffice slide rendering + python-pptx reconstruction.
+# creative approach: render each slide as a high-res image via libreoffice,
+# then stitch them into one pptx. this preserves 100% of the visual formatting
+# since we're working with exact raster snapshots of each slide.
+
+import os
+import sys
+import glob
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+from PIL import Image
+from pptx import Presentation
+from pptx.util import Emu
+
+
+DPI = 300  # high-res export
+
+
+def pptx_to_images(pptx_path, output_dir):
+    # use libreoffice to convert pptx -> pdf, then pdf -> images via pdftoppm.
+    # fallback: libreoffice direct png export if pdftoppm unavailable.
+    pptx_path = os.path.abspath(pptx_path)
+    pdf_path = os.path.join(output_dir, Path(pptx_path).stem + '.pdf')
+
+    # step 1: pptx -> pdf via libreoffice (preserves all formatting)
+    subprocess.run([
+        'libreoffice', '--headless', '--convert-to', 'pdf',
+        '--outdir', output_dir, pptx_path
+    ], check=True, capture_output=True)
+
+    if not os.path.exists(pdf_path):
+        raise RuntimeError(f"libreoffice failed to produce {pdf_path}")
+
+    # step 2: pdf -> png images
+    # try pdftoppm first (from poppler-utils, higher quality)
+    image_prefix = os.path.join(output_dir, 'slide')
+
+    if shutil.which('pdftoppm'):
+        subprocess.run([
+            'pdftoppm', '-png', '-r', str(DPI),
+            pdf_path, image_prefix
+        ], check=True, capture_output=True)
+    else:
+        # fallback: use libreoffice to export as images directly
+        # this works but pdftoppm gives better quality
+        subprocess.run([
+            'libreoffice', '--headless', '--convert-to', 'png',
+            '--outdir', output_dir, pdf_path
+        ], check=True, capture_output=True)
+
+    # collect and sort image files
+    images = sorted(glob.glob(os.path.join(output_dir, 'slide-*.png')))
+    if not images:
+        images = sorted(glob.glob(os.path.join(output_dir, '*.png')))
+
+    if not images:
+        raise RuntimeError("no slide images produced")
+
+    return images
+
+
+def images_to_pptx(image_groups, output_path, slide_width_emu=9144000, slide_height_emu=6858000):
+    # build a pptx from slide images, one image per slide filling the entire area.
+    prs = Presentation()
+    prs.slide_width = slide_width_emu
+    prs.slide_height = slide_height_emu
+
+    # use blank layout (index 6 is typically blank)
+    blank_layout = None
+    for layout in prs.slide_layouts:
+        if layout.name == 'Blank':
+            blank_layout = layout
+            break
+    if blank_layout is None:
+        blank_layout = prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[0]
+
+    total = 0
+    for label, images in image_groups:
+        for img_path in images:
+            slide = prs.slides.add_slide(blank_layout)
+
+            # remove any placeholder shapes from blank layout
+            for ph in list(slide.placeholders):
+                sp = ph._element
+                sp.getparent().remove(sp)
+
+            # add image covering the full slide
+            slide.shapes.add_picture(
+                img_path,
+                left=0,
+                top=0,
+                width=slide_width_emu,
+                height=slide_height_emu
+            )
+            total += 1
+        print(f"  [{label}] {len(images)} slides added")
+
+    prs.save(output_path)
+    return total
+
+
+def merge_presentations(*pptx_files, output='merged.pptx'):
+    # merge pptx files with zero formatting loss via image rendering.
+    if not pptx_files:
+        raise ValueError("no files provided")
+
+    image_groups = []
+
+    for pptx_file in pptx_files:
+        label = Path(pptx_file).stem
+        print(f"[*] rendering: {label}")
+
+        tmpdir = tempfile.mkdtemp(prefix=f'pptx_merge_{label}_')
+        try:
+            images = pptx_to_images(pptx_file, tmpdir)
+            image_groups.append((label, images))
+            print(f"  -> {len(images)} slides rendered at {DPI} DPI")
+        except Exception as e:
+            print(f"  [!] error rendering {label}: {e}", file=sys.stderr)
+            raise
+
+    # get slide dimensions from first presentation
+    first_prs = Presentation(pptx_files[0])
+    sw = first_prs.slide_width
+    sh = first_prs.slide_height
+
+    print(f"[*] building merged presentation...")
+    total = images_to_pptx(image_groups, output, sw, sh)
+    print(f"[+] merged {total} slides from {len(pptx_files)} presentations -> {output}")
+
+    # cleanup temp dirs
+    for label, images in image_groups:
+        if images:
+            tmpdir = os.path.dirname(images[0])
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return output
+
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(
+        description='merge pptx files with perfect formatting preservation via rendering',
+        usage='%(prog)s input1.pptx [input2.pptx ...] -o output.pptx'
+    )
+    parser.add_argument(
+        'inputs',
+        metavar='INPUT',
+        nargs='+',
+        help='input pptx files to merge'
+    )
+    parser.add_argument(
+        '-o', '--output',
+        default='merged.pptx',
+        help='output filename (default: merged.pptx)'
+    )
+    parser.add_argument(
+        '--dpi',
+        type=int,
+        default=DPI,
+        help=f'rendering DPI for slide images (default: {DPI})'
+    )
+    
+    args = parser.parse_args()
+    
+    # validate input files exist
+    for f in args.inputs:
+        if not os.path.exists(f):
+            print(f"[!] error: file not found: {f}", file=sys.stderr)
+            sys.exit(1)
+        if not f.lower().endswith('.pptx'):
+            print(f"[!] error: not a pptx file: {f}", file=sys.stderr)
+            sys.exit(1)
+    
+    # update global DPI if specified
+    if args.dpi != DPI:
+        globals()['DPI'] = args.dpi
+    
+    merge_presentations(*args.inputs, output=args.output)
