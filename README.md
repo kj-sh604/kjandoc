@@ -8,9 +8,9 @@
 - pandoc-style usage: `kjandoc input1.pptx input2.pptx -o combined.pptx`
 
 ## why this exists
-pandoc is great, but it can't concatenate powerpoint decks. 
+pandoc is great, but it can't concatenate `.pptx` files. 
 
-this uses a headless libreoffice + pdf -> png rendering to get a pixel-perfect merge. 
+this uses a headless libreoffice + pdf -> png rendering to get a merge with most formatting preserved. 
 
 the tradeoff is the output slides are images (not editable shapes).
 
