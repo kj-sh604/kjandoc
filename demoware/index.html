@@ -1,0 +1,297 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>slide merging demoware</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.min.css">
+    <style>
+        .file-item {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 0.3rem 0;
+        }
+        .file-item button {
+            padding: 0.15rem 0.5rem;
+            margin: 0;
+            font-size: 0.85rem;
+            min-width: 2rem;
+        }
+        .file-item .fname {
+            flex: 1;
+            font-family: var(--font-family, monospace);
+        }
+        #drop-zone {
+            border: 2px dashed #555;
+            padding: 2rem;
+            text-align: center;
+            border-radius: 6px;
+            margin: 1rem 0;
+            cursor: pointer;
+            transition: border-color 0.15s, background 0.15s;
+        }
+        #drop-zone.over {
+            border-color: #7ec8e3;
+            background: rgba(126, 200, 227, 0.06);
+        }
+        #command-display {
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .hidden { display: none !important; }
+        .running { color: #ff9800; }
+        .done    { color: #4caf50; }
+        .error   { color: #f44336; }
+        #log-output {
+            max-height: 300px;
+            overflow-y: auto;
+            font-size: 0.85rem;
+        }
+        footer { margin-top: 2rem; }
+    </style>
+</head>
+<body>
+    <h1>an attempt at a .pptx merging tool</h1>
+    <p>merge multiple <code>.pptx</code> files into a <em>single</em> <code>.pptx</code> file.</p>
+    <hr>
+
+    <h2>1. add files</h2>
+    <div id="drop-zone">
+        drop <code>.pptx</code> files here — or click to browse
+    </div>
+    <input type="file" id="file-input" multiple accept=".pptx" style="margin-top:0.5rem;">
+
+    <h2>2. merge order</h2>
+    <p id="empty-msg"><em>no files added yet.</em></p>
+    <div id="file-list"></div>
+
+    <h2>3. merge</h2>
+    <button id="merge-btn" disabled>merge presentations</button>
+
+    <div id="cmd-section" class="hidden">
+        <h3><code>kjandoc</code> command being used:</h3>
+        <pre id="command-display"></pre>
+    </div>
+
+    <div id="status-section" class="hidden">
+        <p id="status-msg"></p>
+        <pre id="log-output" class="hidden"></pre>
+    </div>
+
+    <div id="dl-section" class="hidden">
+        <a id="dl-link"><button>⬇ download merged presentation</button></a>
+    </div>
+
+    <footer>
+        <small>powered with <a href="https://github.com/kj-sh604/kjandoc" target="_blank" rel="noopener">kjandoc</a> by <a href="https://github.com/kj-sh604" target="_blank" rel="noopener">kj_sh604</a></small>
+    </footer>
+
+    <script>
+    (() => {
+        'use strict';
+
+        // -- state --
+        let files = [];   // {id, name, file}
+        let nextId = 1;
+        let busy = false;
+
+        // -- dom refs --
+        const dropZone  = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('file-input');
+        const fileList  = document.getElementById('file-list');
+        const emptyMsg  = document.getElementById('empty-msg');
+        const mergeBtn  = document.getElementById('merge-btn');
+        const cmdSec    = document.getElementById('cmd-section');
+        const cmdPre    = document.getElementById('command-display');
+        const statusSec = document.getElementById('status-section');
+        const statusMsg = document.getElementById('status-msg');
+        const logPre    = document.getElementById('log-output');
+        const dlSec     = document.getElementById('dl-section');
+        const dlLink    = document.getElementById('dl-link');
+
+        // -- file input --
+        fileInput.addEventListener('change', () => {
+            addFiles(fileInput.files);
+            fileInput.value = '';
+        });
+
+        // -- drag & drop --
+        dropZone.addEventListener('dragover', e => {
+            e.preventDefault();
+            dropZone.classList.add('over');
+        });
+        dropZone.addEventListener('dragleave', () => dropZone.classList.remove('over'));
+        dropZone.addEventListener('drop', e => {
+            e.preventDefault();
+            dropZone.classList.remove('over');
+            addFiles(e.dataTransfer.files);
+        });
+        dropZone.addEventListener('click', () => fileInput.click());
+
+        // -- list management --
+
+        function addFiles(rawFiles) {
+            for (const f of rawFiles) {
+                if (!f.name.toLowerCase().endsWith('.pptx')) continue;
+                files.push({ id: nextId++, name: f.name, file: f });
+            }
+            render();
+        }
+
+        function render() {
+            fileList.innerHTML = '';
+
+            if (files.length === 0) {
+                emptyMsg.classList.remove('hidden');
+                mergeBtn.disabled = true;
+                return;
+            }
+
+            emptyMsg.classList.add('hidden');
+            mergeBtn.disabled = busy;
+
+            files.forEach((item, i) => {
+                const row = document.createElement('div');
+                row.className = 'file-item';
+
+                const up = mkbtn('▲', i === 0,               () => swap(i, i - 1));
+                const dn = mkbtn('▼', i === files.length - 1, () => swap(i, i + 1));
+                const rm = mkbtn('✕', false,                   () => { files.splice(i, 1); render(); });
+
+                const span = document.createElement('span');
+                span.className = 'fname';
+                span.textContent = (i + 1) + '. ' + item.name;
+
+                row.append(up, dn, rm, span);
+                fileList.appendChild(row);
+            });
+        }
+
+        function mkbtn(label, disabled, onclick) {
+            const b = document.createElement('button');
+            b.textContent = label;
+            b.disabled = disabled;
+            b.onclick = onclick;
+            return b;
+        }
+
+        function swap(a, b) {
+            [files[a], files[b]] = [files[b], files[a]];
+            render();
+        }
+
+        // -- merge flow --
+
+        mergeBtn.addEventListener('click', async () => {
+            if (files.length === 0 || busy) return;
+            busy = true;
+            mergeBtn.disabled = true;
+
+            // reset ui sections
+            cmdSec.classList.add('hidden');
+            statusSec.classList.add('hidden');
+            dlSec.classList.add('hidden');
+            logPre.textContent = '';
+            logPre.classList.add('hidden');
+
+            const jobId = Date.now() + '_' + rnd();
+
+            statusSec.classList.remove('hidden');
+
+            // 1. upload each file
+            for (let i = 0; i < files.length; i++) {
+                const item = files[i];
+                statusMsg.textContent = 'uploading ' + (i + 1) + '/' + files.length + ': ' + item.name;
+                statusMsg.className = 'running';
+
+                const serverName = item.id + '_' + item.name;
+                try {
+                    const res = await fetch('/api/upload', {
+                        method: 'POST',
+                        headers: {
+                            'X-Job-Id': jobId,
+                            'X-Filename': encodeURIComponent(serverName),
+                        },
+                        body: item.file,
+                    });
+                    if (!res.ok) {
+                        const err = await res.json().catch(() => ({ error: 'upload failed' }));
+                        throw new Error(err.error);
+                    }
+                } catch (e) {
+                    statusMsg.textContent = 'upload error: ' + e.message;
+                    statusMsg.className = 'error';
+                    busy = false;
+                    mergeBtn.disabled = false;
+                    return;
+                }
+            }
+
+            // 2. send merge request
+            statusMsg.textContent = 'starting merge...';
+            const serverFiles = files.map(f => f.id + '_' + f.name);
+
+            let mergeData;
+            try {
+                const res = await fetch('/api/merge', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ job_id: jobId, files: serverFiles }),
+                });
+                mergeData = await res.json();
+                if (!res.ok) throw new Error(mergeData.error || 'merge failed');
+            } catch (e) {
+                statusMsg.textContent = 'merge error: ' + e.message;
+                statusMsg.className = 'error';
+                busy = false;
+                mergeBtn.disabled = false;
+                return;
+            }
+
+            // 3. show the command
+            cmdSec.classList.remove('hidden');
+            cmdPre.textContent = '$ ' + mergeData.command;
+
+            // 4. poll for completion
+            statusMsg.textContent = 'merging... this may take a while depending on slide count.';
+
+            const poll = setInterval(async () => {
+                try {
+                    const res = await fetch('/api/status/' + jobId);
+                    const s = await res.json();
+
+                    if (s.log) {
+                        logPre.classList.remove('hidden');
+                        logPre.textContent = s.log;
+                    }
+
+                    if (s.status === 'done') {
+                        clearInterval(poll);
+                        statusMsg.textContent = 'merge complete!';
+                        statusMsg.className = 'done';
+                        dlSec.classList.remove('hidden');
+                        dlLink.href = '/output/' + mergeData.output;
+                        dlLink.download = mergeData.output;
+                        busy = false;
+                        mergeBtn.disabled = false;
+                    } else if (s.status === 'error') {
+                        clearInterval(poll);
+                        statusMsg.textContent = 'merge failed — check the log below.';
+                        statusMsg.className = 'error';
+                        busy = false;
+                        mergeBtn.disabled = false;
+                    }
+                } catch (_) {
+                    // network hiccup, keep polling
+                }
+            }, 2000);
+        });
+
+        function rnd() {
+            return Math.random().toString(36).substring(2, 10);
+        }
+    })();
+    </script>
+</body>
+</html>
