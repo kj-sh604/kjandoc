@@ -1,6 +1,9 @@
 FROM ubuntu:24.04
 
-ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 # system deps + libreoffice fresh ppa
 RUN apt-get update && \
@@ -22,7 +25,7 @@ RUN apt-get update && \
 
 # python deps
 COPY src/requirements.txt /tmp/requirements.txt
-RUN pip3 install --no-cache-dir --break-system-packages -r /tmp/requirements.txt
+RUN pip3 install --no-cache-dir --no-compile --break-system-packages -r /tmp/requirements.txt
 
 # kjandoc binary -> /usr/local/bin
 COPY src/kjandoc /usr/local/bin/kjandoc
