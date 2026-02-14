@@ -24,7 +24,6 @@ PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
 BASE_DIR = Path(__file__).parent.resolve()
 UPLOAD_DIR = BASE_DIR / 'uploads'
 OUTPUT_DIR = BASE_DIR / 'output'
-KJANDOC = (BASE_DIR.parent / 'src' / 'kjandoc').resolve()
 
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -133,7 +132,7 @@ class Handler(SimpleHTTPRequestHandler):
 
         # build the real command
         inputs = [str(job_dir / f) for f in files]
-        cmd = [sys.executable, str(KJANDOC)] + inputs + ['-o', str(out_path)]
+        cmd = ['kjandoc'] + inputs + ['-o', str(out_path)]
 
         # pretty command for display (strip numeric id prefixes like "3_")
         pretty_names = []
@@ -189,15 +188,16 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def main():
-    if not KJANDOC.exists():
-        print(f"[!] kjandoc not found: {KJANDOC}", file=sys.stderr)
-        print(f"    expected at ../src/kjandoc relative to this script", file=sys.stderr)
+    kjandoc_path = shutil.which('kjandoc')
+    if not kjandoc_path:
+        print(f"[!] kjandoc not found in PATH", file=sys.stderr)
+        print(f"    install kjandoc or ensure it's available in your PATH", file=sys.stderr)
         sys.exit(1)
 
     srv = ThreadedServer(('', PORT), Handler)
     print(f"[*] kjandoc demoware")
     print(f"[*] http://localhost:{PORT}")
-    print(f"[*] kjandoc: {KJANDOC}")
+    print(f"[*] kjandoc: {kjandoc_path}")
     print(f"[*] ctrl-c to stop")
     try:
         srv.serve_forever()
