@@ -4,6 +4,10 @@
 
 https://github.com/user-attachments/assets/915940ab-f6a5-4e6f-b8dc-62de81d35c62
 
+https://github.com/user-attachments/assets/c7fe58c1-ff76-41bf-977b-870247a6a3e2
+
+
+
 ## what it does
 - merges multiple .pptx files into one
 - preserves visual formatting by rendering slides and rebuilding a new deck
