@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+
+# concatenate pptx files that share the same template/slide master.
+# preserves full editability + formatting by copying slides natively
+# via python-pptx xml manipulation, with a libreoffice normalization pass.
+
+import os
+import sys
+import copy
+import shutil
+import subprocess
+import tempfile
+import uuid
+from pathlib import Path
+from pptx import Presentation
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.opc.packuri import PackURI
+
+
+PML_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+REL_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+
+
+def _remap_rels(elem, rid_map):
+    """recursively update r:embed, r:link, r:id attributes in an xml tree."""
+    r_ns_braced = f'{{{REL_NS}}}'
+    for e in elem.iter():
+        for attr in list(e.attrib.keys()):
+            if r_ns_braced in attr:
+                old = e.attrib[attr]
+                if old in rid_map:
+                    e.attrib[attr] = rid_map[old]
+
+
+def _unique_media_partname(ext):
+    """generate a unique partname for media content to avoid collisions."""
+    uid = uuid.uuid4().hex[:12]
+    return PackURI(f'/ppt/media/img_{uid}.{ext}')
+
+
+def copy_slide(src_slide, dst_prs):
+    """copy a single slide from another presentation into dst_prs.
+    assumes presentations share the same template (matching slide layout names)."""
+
+    # match slide layout by name
+    src_layout_name = src_slide.slide_layout.name
+    dst_layout = None
+    for layout in dst_prs.slide_layouts:
+        if layout.name == src_layout_name:
+            dst_layout = layout
+            break
+    if dst_layout is None:
+        dst_layout = dst_prs.slide_layouts[0]
+        print(f"  [!] layout '{src_layout_name}' not in dest, using '{dst_layout.name}'")
+
+    # create new slide with the matching layout
+    new_slide = dst_prs.slides.add_slide(dst_layout)
+
+    # build relationship mapping — copy all non-layout, non-notes rels
+    rid_map = {}
+    for rel in src_slide.part.rels.values():
+        # layout rel already established by add_slide
+        if rel.reltype == RT.SLIDE_LAYOUT:
+            continue
+        # skip notes slides — cross-presentation layout complexity,
+        # rarely needed in merged output
+        if 'notesSlide' in rel.reltype:
+            continue
+
+        try:
+            if rel.is_external:
+                new_rid = new_slide.part.relate_to(
+                    rel.target_ref, rel.reltype, is_external=True
+                )
+            else:
+                src_part = rel.target_part
+                partname_str = str(src_part.partname)
+
+                # for image/media parts, create new parts with unique names
+                # to avoid partname collisions across source presentations
+                if '/media/' in partname_str or 'image' in rel.reltype.lower():
+                    ext = partname_str.rsplit('.', 1)[-1] if '.' in partname_str else 'png'
+                    new_partname = _unique_media_partname(ext)
+                    new_part = type(src_part)(new_partname, src_part.content_type, src_part.blob, dst_prs.part.package)
+                    new_rid = new_slide.part.relate_to(new_part, rel.reltype)
+                else:
+                    # non-media parts (charts, etc.) — relate directly
+                    new_rid = new_slide.part.relate_to(src_part, rel.reltype)
+
+            rid_map[rel.rId] = new_rid
+        except Exception as exc:
+            print(f"  [!] skipped rel {rel.rId} ({rel.reltype}): {exc}")
+
+    # replace slide xml content
+    src_sld = src_slide._element
+    dst_sld = new_slide._element
+
+    # replace <p:cSld> (common slide data — shape tree, background, etc.)
+    old_cSld = dst_sld.find(f'{{{PML_NS}}}cSld')
+    src_cSld = src_sld.find(f'{{{PML_NS}}}cSld')
+    if src_cSld is not None:
+        new_cSld = copy.deepcopy(src_cSld)
+        _remap_rels(new_cSld, rid_map)
+        if old_cSld is not None:
+            idx = list(dst_sld).index(old_cSld)
+            dst_sld.remove(old_cSld)
+            dst_sld.insert(idx, new_cSld)
+        else:
+            dst_sld.insert(0, new_cSld)
+
+    # copy clrMapOvr, transition, timing, extLst if present in source
+    for tag in ('clrMapOvr', 'transition', 'timing', 'extLst'):
+        src_elem = src_sld.find(f'{{{PML_NS}}}{tag}')
+        if src_elem is not None:
+            new_elem = copy.deepcopy(src_elem)
+            _remap_rels(new_elem, rid_map)
+            # remove existing in destination
+            old_elem = dst_sld.find(f'{{{PML_NS}}}{tag}')
+            if old_elem is not None:
+                dst_sld.remove(old_elem)
+            dst_sld.append(new_elem)
+
+    return new_slide
+
+
+def lo_normalize(pptx_path, outdir):
+    """run a pptx through libreoffice headless to normalize internal xml.
+    this fixes any relationship inconsistencies from our xml manipulation."""
+    abs_path = os.path.abspath(pptx_path)
+    subprocess.run([
+        'libreoffice', '--headless', '--convert-to', 'pptx',
+        '--outdir', outdir, abs_path
+    ], check=True, capture_output=True)
+
+    stem = Path(abs_path).stem
+    for f in os.listdir(outdir):
+        if f.lower().endswith('.pptx'):
+            return os.path.join(outdir, f)
+    raise RuntimeError(f"libreoffice normalization failed for {pptx_path}")
+
+
+def concatenate_presentations(*pptx_files, output='concatenated.pptx'):
+    """concatenate pptx files sharing the same template. preserves full editability."""
+    if not pptx_files:
+        raise ValueError("no files provided")
+
+    # open first pptx as the base presentation (its template wins)
+    print(f"[*] base presentation: {Path(pptx_files[0]).stem}")
+    base_prs = Presentation(pptx_files[0])
+    base_count = len(base_prs.slides)
+    print(f"  -> {base_count} slides")
+
+    # append slides from remaining presentations
+    for i, pf in enumerate(pptx_files[1:], start=1):
+        label = Path(pf).stem
+        print(f"[*] appending: {label}")
+        src_prs = Presentation(pf)
+        src_count = len(src_prs.slides)
+        for slide in src_prs.slides:
+            copy_slide(slide, base_prs)
+        print(f"  -> {src_count} slides appended")
+
+    # save intermediate result
+    raw_output = output + '.tmp.pptx'
+    base_prs.save(raw_output)
+
+    # final libreoffice normalization pass to clean up internal xml
+    print(f"[*] libreoffice normalization pass...")
+    final_dir = tempfile.mkdtemp(prefix='kjandoc_st_final_')
+    try:
+        normalized = lo_normalize(raw_output, final_dir)
+        shutil.copy2(normalized, output)
+        os.unlink(raw_output)
+        print(f"  -> normalized successfully")
+    except Exception as exc:
+        # fallback: raw output is still valid pptx, just not lo-normalized
+        shutil.move(raw_output, output)
+        print(f"  [!] normalization skipped ({exc}), using raw output")
+    finally:
+        shutil.rmtree(final_dir, ignore_errors=True)
+
+    result_prs = Presentation(output)
+    total = len(result_prs.slides)
+    print(f"[+] concatenated {total} slides from {len(pptx_files)} presentations -> {output}")
+
+    return output
+
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description='concatenate pptx files sharing the same template (preserves editability)',
+        usage='%(prog)s input1.pptx [input2.pptx ...] -o output.pptx'
+    )
+    parser.add_argument(
+        'inputs',
+        metavar='INPUT',
+        nargs='+',
+        help='input pptx files to concatenate (must share the same template)'
+    )
+    parser.add_argument(
+        '-o', '--output',
+        default='concatenated.pptx',
+        help='output filename (default: concatenated.pptx)'
+    )
+
+    args = parser.parse_args()
+
+    # validate input files
+    for f in args.inputs:
+        if not os.path.exists(f):
+            print(f"[!] error: file not found: {f}", file=sys.stderr)
+            sys.exit(1)
+        if not f.lower().endswith('.pptx'):
+            print(f"[!] error: not a pptx file: {f}", file=sys.stderr)
+            sys.exit(1)
+
+    concatenate_presentations(*args.inputs, output=args.output)
