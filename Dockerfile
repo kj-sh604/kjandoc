@@ -174,9 +174,10 @@ RUN pip3 install --no-cache-dir --no-compile --break-system-packages -r /tmp/req
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
-# kjandoc binary -> /usr/local/bin
+# kjandoc binaries -> /usr/local/bin
 COPY src/kjandoc /usr/local/bin/kjandoc
-RUN chmod +x /usr/local/bin/kjandoc
+COPY src/kjandoc-st /usr/local/bin/kjandoc-st
+RUN chmod +x /usr/local/bin/kjandoc /usr/local/bin/kjandoc-st
 
 # demoware
 WORKDIR /app
