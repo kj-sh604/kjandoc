@@ -117,12 +117,22 @@ class Handler(SimpleHTTPRequestHandler):
         if not job_dir.exists():
             return self._json(400, {"error": "upload dir not found — did you upload first?"})
 
+        mode = data.get('mode', 'render')
+        if mode not in ('render', 'same-template'):
+            return self._json(400, {"error": f"invalid mode: {mode}"})
+
         # validate filenames (no path traversal)
         for f in files:
             if '/' in f or '\\' in f or '..' in f:
                 return self._json(400, {"error": f"bad filename: {f}"})
             if not (job_dir / f).exists():
                 return self._json(400, {"error": f"not found: {f}"})
+
+        # pick the right binary
+        binary = 'kjandoc-st' if mode == 'same-template' else 'kjandoc'
+
+        if not shutil.which(binary):
+            return self._json(500, {"error": f"{binary} not found in PATH"})
 
         # output: epoch_shortid.pptx
         epoch = int(time.time())
@@ -132,14 +142,14 @@ class Handler(SimpleHTTPRequestHandler):
 
         # build the real command
         inputs = [str(job_dir / f) for f in files]
-        cmd = ['kjandoc'] + inputs + ['-o', str(out_path)]
+        cmd = [binary] + inputs + ['-o', str(out_path)]
 
         # pretty command for display (strip numeric id prefixes like "3_")
         pretty_names = []
         for f in files:
             parts = f.split('_', 1)
             pretty_names.append(parts[1] if len(parts) == 2 and parts[0].isdigit() else f)
-        cmd_str = f"kjandoc {' '.join(pretty_names)} -o output/{out_name}"
+        cmd_str = f"{binary} {' '.join(pretty_names)} -o output/{out_name}"
 
         with jobs_lock:
             jobs[job_id] = {
@@ -194,10 +204,16 @@ def main():
         print(f"    install kjandoc or ensure it's available in your PATH", file=sys.stderr)
         sys.exit(1)
 
+    st_path = shutil.which('kjandoc-st')
+
     srv = ThreadedServer(('', PORT), Handler)
     print(f"[*] kjandoc demoware")
     print(f"[*] http://localhost:{PORT}")
     print(f"[*] kjandoc: {kjandoc_path}")
+    if st_path:
+        print(f"[*] kjandoc-st: {st_path}")
+    else:
+        print(f"[!] kjandoc-st not found (same-template mode unavailable)")
     print(f"[*] ctrl-c to stop")
     try:
         srv.serve_forever()
