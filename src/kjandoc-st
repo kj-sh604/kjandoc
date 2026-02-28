@@ -1,187 +1,299 @@
 #!/usr/bin/env python3
 
-# concatenate pptx files that share the same template/slide master.
-# preserves full editability + formatting by copying slides natively
-# via python-pptx xml manipulation, with a libreoffice normalization pass.
-
 import os
 import sys
-import copy
 import shutil
 import subprocess
 import tempfile
 import uuid
+import zipfile
 from pathlib import Path
-from pptx import Presentation
-from pptx.opc.constants import RELATIONSHIP_TYPE as RT
-from pptx.opc.packuri import PackURI
+from lxml import etree
 
 
-PML_NS = 'http://schemas.openxmlformats.org/presentationml/2006/main'
-REL_NS = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+NS = {
+    'office':       'urn:oasis:names:tc:opendocument:xmlns:office:1.0',
+    'draw':         'urn:oasis:names:tc:opendocument:xmlns:drawing:1.0',
+    'style':        'urn:oasis:names:tc:opendocument:xmlns:style:1.0',
+    'presentation': 'urn:oasis:names:tc:opendocument:xmlns:presentation:1.0',
+    'text':         'urn:oasis:names:tc:opendocument:xmlns:text:1.0',
+    'table':        'urn:oasis:names:tc:opendocument:xmlns:table:1.0',
+    'xlink':        'http://www.w3.org/1999/xlink',
+    'manifest':     'urn:oasis:names:tc:opendocument:xmlns:manifest:1.0',
+}
 
 
-def _remap_rels(elem, rid_map):
-    """recursively update r:embed, r:link, r:id attributes in an xml tree."""
-    r_ns_braced = f'{{{REL_NS}}}'
+def _ns(prefix, local):
+    """expand namespace prefix to clark notation."""
+    return f'{{{NS[prefix]}}}{local}'
+
+
+# attributes that can reference auto-style names in odp content
+STYLE_REF_ATTRS = [
+    _ns('draw', 'style-name'),
+    _ns('draw', 'text-style-name'),
+    _ns('presentation', 'style-name'),
+    _ns('text', 'style-name'),
+    _ns('table', 'style-name'),
+    _ns('style', 'parent-style-name'),
+    _ns('style', 'list-style-name'),
+    _ns('style', 'data-style-name'),
+]
+
+# declaration use-* attributes on draw:page elements
+DECL_USE_ATTRS = [
+    _ns('presentation', 'use-header-name'),
+    _ns('presentation', 'use-footer-name'),
+    _ns('presentation', 'use-date-time-name'),
+]
+
+# declaration element tags
+DECL_TAGS = [
+    _ns('presentation', 'header-decl'),
+    _ns('presentation', 'footer-decl'),
+    _ns('presentation', 'date-time-decl'),
+]
+
+# extension -> mime type for manifest entries
+EXT_TO_MIME = {
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif', '.svg': 'image/svg+xml', '.svgz': 'image/svg+xml',
+    '.wmf': 'image/x-wmf', '.emf': 'image/x-emf',
+    '.bmp': 'image/bmp', '.tif': 'image/tiff', '.tiff': 'image/tiff',
+}
+
+
+# helpers
+def _restyle(elem, style_map):
+    """recursively update style-name references in an element tree."""
     for e in elem.iter():
-        for attr in list(e.attrib.keys()):
-            if r_ns_braced in attr:
-                old = e.attrib[attr]
-                if old in rid_map:
-                    e.attrib[attr] = rid_map[old]
+        for attr in STYLE_REF_ATTRS:
+            val = e.get(attr)
+            if val and val in style_map:
+                e.set(attr, style_map[val])
 
 
-def _unique_media_partname(ext):
-    """generate a unique partname for media content to avoid collisions."""
-    uid = uuid.uuid4().hex[:12]
-    return PackURI(f'/ppt/media/img_{uid}.{ext}')
+def _remap_hrefs(elem, href_map):
+    """update xlink:href references for remapped media files."""
+    attr = _ns('xlink', 'href')
+    for e in elem.iter():
+        val = e.get(attr)
+        if val and val in href_map:
+            e.set(attr, href_map[val])
 
 
-def copy_slide(src_slide, dst_prs):
-    """copy a single slide from another presentation into dst_prs.
-    assumes presentations share the same template (matching slide layout names)."""
-
-    # match slide layout by name
-    src_layout_name = src_slide.slide_layout.name
-    dst_layout = None
-    for layout in dst_prs.slide_layouts:
-        if layout.name == src_layout_name:
-            dst_layout = layout
-            break
-    if dst_layout is None:
-        dst_layout = dst_prs.slide_layouts[0]
-        print(f"  [!] layout '{src_layout_name}' not in dest, using '{dst_layout.name}'")
-
-    # create new slide with the matching layout
-    new_slide = dst_prs.slides.add_slide(dst_layout)
-
-    # build relationship mapping — copy all non-layout, non-notes rels
-    rid_map = {}
-    for rel in src_slide.part.rels.values():
-        # layout rel already established by add_slide
-        if rel.reltype == RT.SLIDE_LAYOUT:
-            continue
-        # skip notes slides — cross-presentation layout complexity,
-        # rarely needed in merged output
-        if 'notesSlide' in rel.reltype:
-            continue
-
-        try:
-            if rel.is_external:
-                new_rid = new_slide.part.relate_to(
-                    rel.target_ref, rel.reltype, is_external=True
-                )
-            else:
-                src_part = rel.target_part
-                partname_str = str(src_part.partname)
-
-                # for image/media parts, create new parts with unique names
-                # to avoid partname collisions across source presentations
-                if '/media/' in partname_str or 'image' in rel.reltype.lower():
-                    ext = partname_str.rsplit('.', 1)[-1] if '.' in partname_str else 'png'
-                    new_partname = _unique_media_partname(ext)
-                    new_part = type(src_part)(new_partname, src_part.content_type, src_part.blob, dst_prs.part.package)
-                    new_rid = new_slide.part.relate_to(new_part, rel.reltype)
-                else:
-                    # non-media parts (charts, etc.) — relate directly
-                    new_rid = new_slide.part.relate_to(src_part, rel.reltype)
-
-            rid_map[rel.rId] = new_rid
-        except Exception as exc:
-            print(f"  [!] skipped rel {rel.rId} ({rel.reltype}): {exc}")
-
-    # replace slide xml content
-    src_sld = src_slide._element
-    dst_sld = new_slide._element
-
-    # replace <p:cSld> (common slide data — shape tree, background, etc.)
-    old_cSld = dst_sld.find(f'{{{PML_NS}}}cSld')
-    src_cSld = src_sld.find(f'{{{PML_NS}}}cSld')
-    if src_cSld is not None:
-        new_cSld = copy.deepcopy(src_cSld)
-        _remap_rels(new_cSld, rid_map)
-        if old_cSld is not None:
-            idx = list(dst_sld).index(old_cSld)
-            dst_sld.remove(old_cSld)
-            dst_sld.insert(idx, new_cSld)
-        else:
-            dst_sld.insert(0, new_cSld)
-
-    # copy clrMapOvr, transition, timing, extLst if present in source
-    for tag in ('clrMapOvr', 'transition', 'timing', 'extLst'):
-        src_elem = src_sld.find(f'{{{PML_NS}}}{tag}')
-        if src_elem is not None:
-            new_elem = copy.deepcopy(src_elem)
-            _remap_rels(new_elem, rid_map)
-            # remove existing in destination
-            old_elem = dst_sld.find(f'{{{PML_NS}}}{tag}')
-            if old_elem is not None:
-                dst_sld.remove(old_elem)
-            dst_sld.append(new_elem)
-
-    return new_slide
+def _remap_decls(page, decl_map):
+    """update declaration use-* references on a draw:page."""
+    for attr in DECL_USE_ATTRS:
+        val = page.get(attr)
+        if val and val in decl_map:
+            page.set(attr, decl_map[val])
 
 
-def lo_normalize(pptx_path, outdir):
-    """run a pptx through libreoffice headless to normalize internal xml.
-    this fixes any relationship inconsistencies from our xml manipulation."""
-    abs_path = os.path.abspath(pptx_path)
+def _lo_convert(input_path, fmt, outdir):
+    """convert a file via libreoffice --headless."""
     subprocess.run([
-        'libreoffice', '--headless', '--convert-to', 'pptx',
-        '--outdir', outdir, abs_path
+        'libreoffice', '--headless', '--convert-to', fmt,
+        '--outdir', outdir, os.path.abspath(input_path)
     ], check=True, capture_output=True)
 
-    stem = Path(abs_path).stem
     for f in os.listdir(outdir):
-        if f.lower().endswith('.pptx'):
+        if f.lower().endswith(f'.{fmt}'):
             return os.path.join(outdir, f)
-    raise RuntimeError(f"libreoffice normalization failed for {pptx_path}")
+    raise RuntimeError(f"libreoffice failed to convert {input_path} to {fmt}")
 
+
+def _repack_odp(directory, output_path):
+    """zip a directory back into a valid odp file.
+    mimetype entry must be first and stored uncompressed (odf spec)."""
+    with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        mimetype = os.path.join(directory, 'mimetype')
+        if os.path.exists(mimetype):
+            zf.write(mimetype, 'mimetype', compress_type=zipfile.ZIP_STORED)
+
+        for root, dirs, files in os.walk(directory):
+            dirs.sort()
+            for f in sorted(files):
+                full = os.path.join(root, f)
+                arcname = os.path.relpath(full, directory)
+                if arcname == 'mimetype':
+                    continue
+                zf.write(full, arcname)
+
+
+# core: concatenate odp files
+
+def _concat_odps(odp_paths, output_odp):
+    """concatenate slides from multiple odp files into one.
+    assumes all presentations share the same template/master pages."""
+    work_dir = tempfile.mkdtemp(prefix='kjandoc_st_')
+
+    try:
+        # extract base odp
+        base_dir = os.path.join(work_dir, 'base')
+        with zipfile.ZipFile(odp_paths[0], 'r') as z:
+            z.extractall(base_dir)
+
+        # parse base content.xml
+        content_xml = os.path.join(base_dir, 'content.xml')
+        content_tree = etree.parse(content_xml)
+        croot = content_tree.getroot()
+
+        auto_styles = croot.find(_ns('office', 'automatic-styles'))
+        body = croot.find(_ns('office', 'body'))
+        pres = body.find(_ns('office', 'presentation'))
+
+        # parse manifest
+        manifest_xml = os.path.join(base_dir, 'META-INF', 'manifest.xml')
+        manifest_tree = etree.parse(manifest_xml)
+        manifest_root = manifest_tree.getroot()
+
+        base_pages = pres.findall(_ns('draw', 'page'))
+        print(f"  -> base: {len(base_pages)} slides")
+
+        # process each additional odp
+        for idx, odp_path in enumerate(odp_paths[1:], start=2):
+            prefix = f'_s{idx}_'
+            label = Path(odp_path).stem
+
+            add_dir = os.path.join(work_dir, f'add_{idx}')
+            with zipfile.ZipFile(odp_path, 'r') as z:
+                z.extractall(add_dir)
+
+            add_tree = etree.parse(os.path.join(add_dir, 'content.xml'))
+            add_root = add_tree.getroot()
+            add_auto = add_root.find(_ns('office', 'automatic-styles'))
+            add_body = add_root.find(_ns('office', 'body'))
+            add_pres = add_body.find(_ns('office', 'presentation'))
+
+            # auto-style rename map (first pass — collect all names)
+
+            style_map = {}
+            for s in add_auto:
+                old_name = s.get(_ns('style', 'name'))
+                if old_name:
+                    style_map[old_name] = prefix + old_name
+
+            # rename and append auto-styles (second pass)
+            for s in list(add_auto):
+                old_name = s.get(_ns('style', 'name'))
+                if old_name and old_name in style_map:
+                    s.set(_ns('style', 'name'), style_map[old_name])
+                _restyle(s, style_map)
+                auto_styles.append(s)
+
+            # copy media (Pictures/) with unique names
+
+            href_map = {}
+            add_pics = os.path.join(add_dir, 'Pictures')
+            base_pics = os.path.join(base_dir, 'Pictures')
+            os.makedirs(base_pics, exist_ok=True)
+
+            if os.path.isdir(add_pics):
+                for mf in os.listdir(add_pics):
+                    ext = Path(mf).suffix
+                    uid = uuid.uuid4().hex[:8]
+                    new_name = f'{prefix}{uid}{ext}'
+                    shutil.copy2(
+                        os.path.join(add_pics, mf),
+                        os.path.join(base_pics, new_name)
+                    )
+                    href_map[f'Pictures/{mf}'] = f'Pictures/{new_name}'
+
+                    # manifest entry
+                    fe = etree.SubElement(manifest_root, _ns('manifest', 'file-entry'))
+                    fe.set(_ns('manifest', 'full-path'), f'Pictures/{new_name}')
+                    fe.set(
+                        _ns('manifest', 'media-type'),
+                        EXT_TO_MIME.get(ext.lower(), 'application/octet-stream')
+                    )
+
+            # copy header/footer/datetime declarations
+
+            decl_map = {}
+            decl_name_attr = _ns('presentation', 'name')
+
+            # find insertion point: just before the first draw:page
+            first_page = pres.find(_ns('draw', 'page'))
+            insert_idx = list(pres).index(first_page) if first_page is not None else len(pres)
+
+            for tag in DECL_TAGS:
+                for decl in add_pres.findall(tag):
+                    old_name = decl.get(decl_name_attr)
+                    if old_name:
+                        new_name = prefix + old_name
+                        decl_map[old_name] = new_name
+                        decl.set(decl_name_attr, new_name)
+                    pres.insert(insert_idx, decl)
+                    insert_idx += 1
+
+            # append slides
+
+            page_count = 0
+            for page in list(add_pres.findall(_ns('draw', 'page'))):
+                # rename page to avoid name collisions
+                old_page_name = page.get(_ns('draw', 'name'))
+                if old_page_name:
+                    page.set(_ns('draw', 'name'), prefix + old_page_name)
+
+                _restyle(page, style_map)
+                _remap_hrefs(page, href_map)
+                _remap_decls(page, decl_map)
+                pres.append(page)
+                page_count += 1
+
+            print(f"  -> {label}: {page_count} slides appended")
+
+        # write out modified xml
+        content_tree.write(content_xml, xml_declaration=True, encoding='UTF-8')
+        manifest_tree.write(manifest_xml, xml_declaration=True, encoding='UTF-8')
+
+        # repack as odp
+        _repack_odp(base_dir, output_odp)
+
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    return output_odp
+
+
+# main entry point
 
 def concatenate_presentations(*pptx_files, output='concatenated.pptx'):
-    """concatenate pptx files sharing the same template. preserves full editability."""
+    """concatenate pptx files via odp round-trip. preserves full editability."""
     if not pptx_files:
         raise ValueError("no files provided")
 
-    # open first pptx as the base presentation (its template wins)
-    print(f"[*] base presentation: {Path(pptx_files[0]).stem}")
-    base_prs = Presentation(pptx_files[0])
-    base_count = len(base_prs.slides)
-    print(f"  -> {base_count} slides")
+    work_dir = tempfile.mkdtemp(prefix='kjandoc_st_main_')
 
-    # append slides from remaining presentations
-    for i, pf in enumerate(pptx_files[1:], start=1):
-        label = Path(pf).stem
-        print(f"[*] appending: {label}")
-        src_prs = Presentation(pf)
-        src_count = len(src_prs.slides)
-        for slide in src_prs.slides:
-            copy_slide(slide, base_prs)
-        print(f"  -> {src_count} slides appended")
-
-    # save intermediate result
-    raw_output = output + '.tmp.pptx'
-    base_prs.save(raw_output)
-
-    # final libreoffice normalization pass to clean up internal xml
-    print(f"[*] libreoffice normalization pass...")
-    final_dir = tempfile.mkdtemp(prefix='kjandoc_st_final_')
     try:
-        normalized = lo_normalize(raw_output, final_dir)
-        shutil.copy2(normalized, output)
-        os.unlink(raw_output)
-        print(f"  -> normalized successfully")
-    except Exception as exc:
-        # fallback: raw output is still valid pptx, just not lo-normalized
-        shutil.move(raw_output, output)
-        print(f"  [!] normalization skipped ({exc}), using raw output")
-    finally:
-        shutil.rmtree(final_dir, ignore_errors=True)
+        # step 1: pptx -> odp (libreoffice native format, lossless)
+        odp_paths = []
+        for pf in pptx_files:
+            label = Path(pf).stem
+            print(f"[*] converting to odp: {label}")
+            conv_dir = os.path.join(work_dir, f'conv_{label}_{uuid.uuid4().hex[:6]}')
+            os.makedirs(conv_dir)
+            odp = _lo_convert(pf, 'odp', conv_dir)
+            odp_paths.append(odp)
 
-    result_prs = Presentation(output)
-    total = len(result_prs.slides)
-    print(f"[+] concatenated {total} slides from {len(pptx_files)} presentations -> {output}")
+        # step 2: concatenate at odp xml level
+        print(f"[*] concatenating slides...")
+        combined_odp = os.path.join(work_dir, 'combined.odp')
+        _concat_odps(odp_paths, combined_odp)
+
+        # step 3: odp -> pptx (libreoffice produces clean editable pptx)
+        print(f"[*] converting to pptx...")
+        final_dir = os.path.join(work_dir, 'final')
+        os.makedirs(final_dir)
+        result_pptx = _lo_convert(combined_odp, 'pptx', final_dir)
+        shutil.copy2(result_pptx, output)
+
+        print(f"[+] concatenated -> {output}")
+        print(f"[+] text and shapes remain fully editable")
+
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
     return output
 
