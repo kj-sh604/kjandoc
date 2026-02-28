@@ -290,7 +290,6 @@ def concatenate_presentations(*pptx_files, output='concatenated.pptx'):
         shutil.copy2(result_pptx, output)
 
         print(f"[+] concatenated -> {output}")
-        print(f"[+] text and shapes remain fully editable")
 
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
