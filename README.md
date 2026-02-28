@@ -10,31 +10,32 @@ https://github.com/user-attachments/assets/c7fe58c1-ff76-41bf-977b-870247a6a3e2
 
 ## what it does
 - merges multiple .pptx files into one
-- preserves visual formatting by rendering slides and rebuilding a new deck
+- preserves full editability, with 99% fidelity to the original formatting (some minor quirks may occur)
+- copies slide masters, layouts, themes, notes, and embedded media
 - `pandoc`-style usage: `kjandoc input1.pptx input2.pptx -o combined.pptx`
 
 ## why this exists
-`pandoc` is great, but it can't concatenate `.pptx` files. 
+`pandoc` is great, but it can't concatenate `.pptx` files.
 
-this uses a headless libreoffice + pdf -> png rendering to get a merge with most formatting preserved. 
+this works directly at the OOXML/ZIP level: it reads each `.pptx` as a ZIP archive, rewires all internal XML relationships, and writes a new near full Microsoft-compliant `.pptx`.
 
-the tradeoff is the output slides are images (not editable shapes).
+a final LibreOffice normalization pass cleans up any lingering structural quirks to prevent PowerPoint repair prompts (not guaranteed though).
 
 ## usage
 ```bash
 # pandoc-style usage
 ./kjandoc input1.pptx input2.pptx -o combined.pptx
 
-# tweak quality
-./kjandoc input1.pptx input2.pptx -o combined.pptx --dpi 150
+# merge more than two
+./kjandoc a.pptx b.pptx c.pptx -o combined.pptx
 ```
 
 ## deps
 - python3
-- libreoffice
-- poppler (pdftoppm)
-- python deps in requirements.txt
+- libreoffice (for the normalization pass)
+- python deps in requirements.txt (`lxml`)
 
 ## notes
-- output size is larger (images)
-- visuals stay intact for the most part
+- output slides are fully editable
+- masters and layouts from all source files are carried over
+- duplicate media files are deduplicated automatically
