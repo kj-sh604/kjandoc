@@ -319,11 +319,65 @@ def _copy_theme(ctx, tgt, src, src_part):
     return tgt_part
 
 
-def _copy_master(ctx, tgt, src, src_part, pres_xml, pres_rels):
-    """Copy a slide master, its theme, and media to target.
+def _copy_layout_for_master(ctx, tgt, src, src_part, tgt_master):
+    """Copy a layout as part of copying its parent master (no master recursion)."""
+    if src_part in ctx.layouts:
+        return ctx.layouts[src_part]
+    if src_part not in src.parts:
+        return src_part
 
-    Also registers the master in presentation.xml and its rels.
-    Skips layout back-references — those are added by _copy_layout.
+    n = _max_num(tgt.parts, r'ppt/slideLayouts/slideLayout(\d+)\.xml') + 1
+    tgt_part = f'ppt/slideLayouts/slideLayout{n}.xml'
+    tgt.parts[tgt_part] = src.parts[src_part]
+    ctx.layouts[src_part] = tgt_part
+
+    src_rels = src.get_rels(src_part)
+    if src_rels is not None:
+        new_rels = etree.Element(f'{{{_PKG_RELS}}}Relationships')
+        for rel in src_rels:
+            rtype = rel.get('Type')
+            if rel.get('TargetMode') == 'External':
+                new_rels.append(deepcopy(rel))
+                continue
+            src_abs = _resolve(src_part, rel.get('Target'))
+            r = deepcopy(rel)
+            if rtype == _RT_MASTER and tgt_master:
+                r.set('Target', _relpath(tgt_part, tgt_master))
+            elif rtype in _MEDIA_TYPES and src_abs in src.parts:
+                r.set('Target', _relpath(tgt_part, _copy_media(ctx, tgt, src, src_abs)))
+            elif src_abs in src.parts:
+                r.set('Target', _relpath(tgt_part, _copy_generic(ctx, tgt, src, src_abs)))
+            new_rels.append(r)
+        tgt.set_rels(tgt_part, new_rels)
+
+    _add_override(tgt, tgt_part, _CT_LAYOUT)
+    return tgt_part
+
+
+def _max_layout_id(pkg):
+    """Find the maximum sldLayoutId 'id' across all masters in the package."""
+    max_id = 2147483648
+    for name in pkg.parts:
+        if (name.startswith('ppt/slideMasters/') and name.endswith('.xml')
+                and '/_rels/' not in name):
+            try:
+                root = pkg.xml(name)
+            except Exception:
+                continue
+            for entry in root.iter(f'{{{_NS_P}}}sldLayoutId'):
+                try:
+                    max_id = max(max_id, int(entry.get('id', 0)))
+                except (ValueError, TypeError):
+                    pass
+    return max_id
+
+
+def _copy_master(ctx, tgt, src, src_part, pres_xml, pres_rels):
+    """Copy a slide master, all its layouts, theme, and media to target.
+
+    Copies every layout the master references so the master's
+    sldLayoutIdLst stays consistent. Layout IDs are reassigned
+    to be globally unique.
     """
     if src_part in ctx.masters:
         return ctx.masters[src_part]
@@ -342,7 +396,8 @@ def _copy_master(ctx, tgt, src, src_part, pres_xml, pres_rels):
     # register early to prevent re-entry
     ctx.masters[src_part] = tgt_part
 
-    # rebuild master rels: remap theme + media, skip layout back-refs
+    # rebuild master rels: copy ALL layouts, remap theme + media
+    # preserving original rIds so the master XML body stays consistent
     src_rels = src.get_rels(src_part)
     if src_rels is not None:
         new_rels = etree.Element(f'{{{_PKG_RELS}}}Relationships')
@@ -353,14 +408,13 @@ def _copy_master(ctx, tgt, src, src_part, pres_xml, pres_rels):
                 new_rels.append(deepcopy(rel))
                 continue
 
-            # skip layout back-references — _copy_layout will add them
-            if rtype == _RT_LAYOUT:
-                continue
-
             src_abs = _resolve(src_part, rel.get('Target'))
             r = deepcopy(rel)
 
-            if rtype == _RT_THEME and tgt_theme:
+            if rtype == _RT_LAYOUT:
+                tgt_layout = _copy_layout_for_master(ctx, tgt, src, src_abs, tgt_part)
+                r.set('Target', _relpath(tgt_part, tgt_layout))
+            elif rtype == _RT_THEME and tgt_theme:
                 r.set('Target', _relpath(tgt_part, tgt_theme))
             elif rtype in _MEDIA_TYPES and src_abs in src.parts:
                 r.set('Target', _relpath(tgt_part, _copy_media(ctx, tgt, src, src_abs)))
@@ -370,6 +424,14 @@ def _copy_master(ctx, tgt, src, src_part, pres_xml, pres_rels):
             new_rels.append(r)
 
         tgt.set_rels(tgt_part, new_rels)
+
+    # reassign sldLayoutId 'id' values to be globally unique
+    max_lid = _max_layout_id(tgt)
+    master_xml = tgt.xml(tgt_part)
+    for entry in master_xml.iter(f'{{{_NS_P}}}sldLayoutId'):
+        max_lid += 1
+        entry.set('id', str(max_lid))
+    tgt.set_xml(tgt_part, master_xml)
 
     _add_override(tgt, tgt_part, _CT_MASTER)
 
@@ -400,66 +462,26 @@ def _copy_master(ctx, tgt, src, src_part, pres_xml, pres_rels):
 def _copy_layout(ctx, tgt, src, src_part, pres_xml, pres_rels):
     """Copy a slide layout and its master+theme chain to target.
 
-    Also adds a back-reference from the master to this layout.
+    _copy_master copies ALL of a master's layouts, so after calling it
+    the requested layout will normally already be in ctx.layouts.
     """
     if src_part in ctx.layouts:
         return ctx.layouts[src_part]
     if src_part not in src.parts:
         return src_part
 
-    # copy the layout's master first
+    # copying the master will also copy all its layouts (including this one)
     master_info = src.find_rel(src_part, _RT_MASTER)
-    tgt_master = None
     if master_info:
-        tgt_master = _copy_master(ctx, tgt, src, master_info[1], pres_xml, pres_rels)
+        _copy_master(ctx, tgt, src, master_info[1], pres_xml, pres_rels)
 
-    # allocate new layout name
-    n = _max_num(tgt.parts, r'ppt/slideLayouts/slideLayout(\d+)\.xml') + 1
-    tgt_part = f'ppt/slideLayouts/slideLayout{n}.xml'
-    tgt.parts[tgt_part] = src.parts[src_part]
+    # master should have copied this layout already
+    if src_part in ctx.layouts:
+        return ctx.layouts[src_part]
 
-    # register early to prevent re-entry
-    ctx.layouts[src_part] = tgt_part
-
-    # rebuild layout rels: remap master + media
-    src_rels = src.get_rels(src_part)
-    if src_rels is not None:
-        new_rels = etree.Element(f'{{{_PKG_RELS}}}Relationships')
-        for rel in src_rels:
-            rtype = rel.get('Type')
-
-            if rel.get('TargetMode') == 'External':
-                new_rels.append(deepcopy(rel))
-                continue
-
-            src_abs = _resolve(src_part, rel.get('Target'))
-            r = deepcopy(rel)
-
-            if rtype == _RT_MASTER and tgt_master:
-                r.set('Target', _relpath(tgt_part, tgt_master))
-            elif rtype in _MEDIA_TYPES and src_abs in src.parts:
-                r.set('Target', _relpath(tgt_part, _copy_media(ctx, tgt, src, src_abs)))
-            elif src_abs in src.parts:
-                r.set('Target', _relpath(tgt_part, _copy_generic(ctx, tgt, src, src_abs)))
-
-            new_rels.append(r)
-
-        tgt.set_rels(tgt_part, new_rels)
-
-    _add_override(tgt, tgt_part, _CT_LAYOUT)
-
-    # add layout back-reference to its master's rels
-    if tgt_master:
-        master_rels = tgt.get_rels(tgt_master)
-        if master_rels is None:
-            master_rels = etree.Element(f'{{{_PKG_RELS}}}Relationships')
-        rid = f'rId{_next_rid(master_rels)}'
-        etree.SubElement(master_rels, f'{{{_PKG_RELS}}}Relationship',
-                         Id=rid, Type=_RT_LAYOUT,
-                         Target=_relpath(tgt_master, tgt_part))
-        tgt.set_rels(tgt_master, master_rels)
-
-    return tgt_part
+    # fallback: layout without a master (unusual) — copy directly
+    tgt_master = ctx.masters.get(master_info[1]) if master_info else None
+    return _copy_layout_for_master(ctx, tgt, src, src_part, tgt_master)
 
 
 def _copy_notes(ctx, tgt, src, src_part, tgt_slide_part):
