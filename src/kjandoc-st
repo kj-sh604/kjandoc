@@ -4,7 +4,10 @@ import argparse
 import hashlib
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import zipfile
 from copy import deepcopy
 from pathlib import Path
@@ -657,6 +660,39 @@ def _merge_source_into(tgt, src, label):
     return count
 
 
+def _lo_normalize(pptx_path):
+    """Re-save a PPTX through LibreOffice to fix any OOXML spec issues.
+
+    LibreOffice reads the file and writes a clean, fully-compliant PPTX.
+    This eliminates intermittent "repair" prompts in Microsoft PowerPoint
+    caused by subtle structural issues (element ordering, stale refs, etc.).
+    """
+    if not shutil.which('libreoffice'):
+        print('  [!] libreoffice not found, skipping normalization', file=sys.stderr)
+        return
+
+    tmpdir = tempfile.mkdtemp(prefix='kjandoc_norm_')
+    try:
+        abs_path = os.path.abspath(pptx_path)
+        subprocess.run([
+            'libreoffice', '--headless', '--convert-to', 'pptx',
+            '--outdir', tmpdir, abs_path
+        ], check=True, capture_output=True)
+
+        # libreoffice writes to tmpdir with the same stem
+        normalized = os.path.join(tmpdir, os.path.basename(abs_path))
+        if os.path.exists(normalized):
+            shutil.move(normalized, abs_path)
+        else:
+            # sometimes libreoffice changes the extension casing
+            for f in os.listdir(tmpdir):
+                if f.lower().endswith('.pptx'):
+                    shutil.move(os.path.join(tmpdir, f), abs_path)
+                    break
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def merge_presentations(input_files, output_path):
     if not input_files:
         raise ValueError('no input files')
@@ -674,6 +710,10 @@ def merge_presentations(input_files, output_path):
         total += count
 
     tgt.save(output_path)
+
+    # normalize through libreoffice to ensure full OOXML compliance
+    print(f'[*] normalizing...')
+    _lo_normalize(output_path)
 
     # count slides in first file for the total
     base = _Pkg(input_files[0])
