@@ -1,184 +1,754 @@
 #!/usr/bin/env python3
 
-# merge pptx files using libreoffice slide rendering + python-pptx reconstruction.
-# creative approach: render each slide as a high-res image via libreoffice,
-# then stitch them into one pptx. this preserves 100% of the visual formatting
-# since we're working with exact raster snapshots of each slide.
-
+import argparse
+import hashlib
 import os
-import sys
-import glob
+import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import zipfile
+from copy import deepcopy
 from pathlib import Path
-from PIL import Image
-from pptx import Presentation
-from pptx.util import Emu
+
+from lxml import etree
 
 
-DPI = 300  # high-res export
+# OOXML
+
+_PKG_RELS = 'http://schemas.openxmlformats.org/package/2006/relationships'
+_PKG_CT = 'http://schemas.openxmlformats.org/package/2006/content-types'
+_NS_P = 'http://schemas.openxmlformats.org/presentationml/2006/main'
+_NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships'
+
+# relationship type URIs
+_RT_SLIDE = _NS_R + '/slide'
+_RT_LAYOUT = _NS_R + '/slideLayout'
+_RT_MASTER = _NS_R + '/slideMaster'
+_RT_THEME = _NS_R + '/theme'
+_RT_NOTES = _NS_R + '/notesSlide'
+_RT_NOTES_MASTER = _NS_R + '/notesMaster'
+_RT_IMAGE = _NS_R + '/image'
+
+# relationship types that target binary media files
+_MEDIA_TYPES = {
+    _RT_IMAGE,
+    _NS_R + '/audio',
+    _NS_R + '/video',
+    'http://schemas.microsoft.com/office/2007/relationships/media',
+    _NS_R + '/oleObject',
+}
+
+# content type strings for OOXML parts
+_CT_SLIDE = 'application/vnd.openxmlformats-officedocument.presentationml.slide+xml'
+_CT_LAYOUT = 'application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml'
+_CT_MASTER = 'application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml'
+_CT_THEME = 'application/vnd.openxmlformats-officedocument.theme+xml'
+_CT_NOTES = 'application/vnd.openxmlformats-officedocument.presentationml.notesSlide+xml'
+
+# common media MIME types by extension
+_MIME = {
+    'png': 'image/png', 'jpg': 'image/jpeg', 'jpeg': 'image/jpeg',
+    'gif': 'image/gif', 'svg': 'image/svg+xml', 'emf': 'image/x-emf',
+    'wmf': 'image/x-wmf', 'tiff': 'image/tiff', 'tif': 'image/tiff',
+    'bmp': 'image/bmp', 'wdp': 'image/vnd.ms-photo',
+    'mp3': 'audio/mpeg', 'wav': 'audio/wav',
+    'mp4': 'video/mp4', 'm4v': 'video/mp4',
+}
 
 
-def pptx_to_images(pptx_path, output_dir):
-    # use libreoffice to convert pptx -> pdf, then pdf -> images via pdftoppm.
-    # fallback: libreoffice direct png export if pdftoppm unavailable.
-    pptx_path = os.path.abspath(pptx_path)
-    pdf_path = os.path.join(output_dir, Path(pptx_path).stem + '.pdf')
+# utility functions
 
-    # step 1: pptx -> pdf via libreoffice (preserves all formatting)
-    subprocess.run([
-        'libreoffice', '--headless', '--convert-to', 'pdf',
-        '--outdir', output_dir, pptx_path
-    ], check=True, capture_output=True)
+def _resolve(base, target):
+    """Resolve a relative relationship target against a base part path.
 
-    if not os.path.exists(pdf_path):
-        raise RuntimeError(f"libreoffice failed to produce {pdf_path}")
+    >>> _resolve('ppt/slides/slide1.xml', '../slideLayouts/slideLayout1.xml')
+    'ppt/slideLayouts/slideLayout1.xml'
+    """
+    if target.startswith('/'):
+        return target.lstrip('/')
+    return os.path.normpath(os.path.join(os.path.dirname(base), target)).replace('\\', '/')
 
-    # step 2: pdf -> png images
-    # try pdftoppm first (from poppler-utils, higher quality)
-    image_prefix = os.path.join(output_dir, 'slide')
 
-    if shutil.which('pdftoppm'):
-        subprocess.run([
-            'pdftoppm', '-png', '-r', str(DPI),
-            pdf_path, image_prefix
-        ], check=True, capture_output=True)
+def _relpath(from_part, to_part):
+    """Relative path from one part's directory to another part.
+
+    >>> _relpath('ppt/slides/slide1.xml', 'ppt/slideLayouts/slideLayout2.xml')
+    '../slideLayouts/slideLayout2.xml'
+    """
+    return os.path.relpath(to_part, os.path.dirname(from_part)).replace('\\', '/')
+
+
+def _max_num(names, pattern):
+    """Find highest number captured by group(1) of pattern across names."""
+    mx, rx = 0, re.compile(pattern)
+    for name in names:
+        m = rx.search(name)
+        if m:
+            mx = max(mx, int(m.group(1)))
+    return mx
+
+
+def _next_rid(rels_element):
+    """Next available rId number from a Relationships XML element."""
+    mx = 0
+    for rel in rels_element:
+        m = re.match(r'rId(\d+)', rel.get('Id', ''))
+        if m:
+            mx = max(mx, int(m.group(1)))
+    return mx + 1
+
+
+def _sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+# in-memory PPTX package
+class _Pkg:
+    """In-memory representation of a PPTX file (an OOXML ZIP package)."""
+
+    def __init__(self, path=None):
+        self.parts = {}  # partname -> bytes
+        if path:
+            with zipfile.ZipFile(path) as zf:
+                for name in zf.namelist():
+                    self.parts[name] = zf.read(name)
+
+    def save(self, path):
+        with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for name in sorted(self.parts):
+                zf.writestr(name, self.parts[name])
+
+    def xml(self, partname):
+        """Parse a part's bytes as XML, return lxml Element."""
+        return etree.fromstring(self.parts[partname])
+
+    def set_xml(self, partname, element):
+        """Serialize an lxml Element back into the package."""
+        self.parts[partname] = etree.tostring(
+            element, xml_declaration=True, encoding='UTF-8', standalone=True
+        )
+
+    def rels_path(self, partname):
+        """Return the .rels path for a given part."""
+        d, b = os.path.dirname(partname), os.path.basename(partname)
+        return f'{d}/_rels/{b}.rels'
+
+    def get_rels(self, partname):
+        """Parse the .rels XML for a part, or return None if absent."""
+        rp = self.rels_path(partname)
+        if rp in self.parts:
+            return self.xml(rp)
+        return None
+
+    def set_rels(self, partname, element):
+        """Write the .rels XML for a part."""
+        rp = self.rels_path(partname)
+        self.set_xml(rp, element)
+
+    def find_rel(self, partname, rel_type):
+        """Find first internal relationship of a given type.
+
+        Returns (rId, resolved_target_partname) or None.
+        """
+        root = self.get_rels(partname)
+        if root is None:
+            return None
+        for rel in root:
+            if rel.get('Type') == rel_type and rel.get('TargetMode') != 'External':
+                return rel.get('Id'), _resolve(partname, rel.get('Target'))
+        return None
+
+
+# content type helpers
+
+def _add_override(pkg, partname, content_type):
+    """Add an Override entry to [Content_Types].xml if not already present."""
+    root = pkg.xml('[Content_Types].xml')
+    abs_name = '/' + partname.lstrip('/')
+    for o in root.findall(f'{{{_PKG_CT}}}Override'):
+        if o.get('PartName') == abs_name:
+            return
+    etree.SubElement(root, f'{{{_PKG_CT}}}Override',
+                     PartName=abs_name, ContentType=content_type)
+    pkg.set_xml('[Content_Types].xml', root)
+
+
+def _add_default_ext(pkg, ext, content_type):
+    """Add a Default entry for a file extension to [Content_Types].xml."""
+    root = pkg.xml('[Content_Types].xml')
+    for d in root.findall(f'{{{_PKG_CT}}}Default'):
+        if d.get('Extension', '').lower() == ext.lower():
+            return
+    etree.SubElement(root, f'{{{_PKG_CT}}}Default',
+                     Extension=ext, ContentType=content_type)
+    pkg.set_xml('[Content_Types].xml', root)
+
+
+def _copy_content_type(tgt, src, src_part, tgt_part):
+    """Copy a content type override from source package to target."""
+    src_root = src.xml('[Content_Types].xml')
+    abs_src = '/' + src_part.lstrip('/')
+    for o in src_root.findall(f'{{{_PKG_CT}}}Override'):
+        if o.get('PartName') == abs_src:
+            _add_override(tgt, tgt_part, o.get('ContentType'))
+            return
+
+
+# merge context
+class _MergeCtx:
+    """Tracks source→target part name mappings during merge of one source file.
+
+    Prevents copying the same source part twice and lets us reuse the target
+    name when multiple slides share the same layout/master/theme/media.
+    """
+    def __init__(self):
+        self.layouts = {}   # src partname -> tgt partname
+        self.masters = {}   # src partname -> tgt partname
+        self.themes = {}    # src partname -> tgt partname
+        self.media = {}     # src partname -> tgt partname
+        self.notes = {}     # src partname -> tgt partname
+        self.generic = {}   # src partname -> tgt partname
+
+
+# part copy functions
+def _copy_media(ctx, tgt, src, src_part):
+    """Copy a media file (image/audio/video) to target, deduplicating by hash."""
+    if src_part in ctx.media:
+        return ctx.media[src_part]
+    if src_part not in src.parts:
+        return src_part
+
+    data = src.parts[src_part]
+    h = _sha256(data)
+
+    # deduplicate: reuse existing media in target with same content
+    for tgt_name, tgt_data in tgt.parts.items():
+        if tgt_name.startswith('ppt/media/') and _sha256(tgt_data) == h:
+            ctx.media[src_part] = tgt_name
+            return tgt_name
+
+    ext = os.path.splitext(src_part)[1]
+    n = _max_num(tgt.parts, r'ppt/media/\w+?(\d+)') + 1
+    tgt_part = f'ppt/media/media{n}{ext}'
+    tgt.parts[tgt_part] = data
+
+    # ensure file extension has a registered MIME type
+    ext_lower = ext.lstrip('.').lower()
+    if ext_lower in _MIME:
+        _add_default_ext(tgt, ext_lower, _MIME[ext_lower])
+
+    ctx.media[src_part] = tgt_part
+    return tgt_part
+
+
+def _copy_generic(ctx, tgt, src, src_part):
+    """Copy a generic part (tags, charts, embeddings, etc.) to target."""
+    if src_part in ctx.generic:
+        return ctx.generic[src_part]
+    if src_part not in src.parts:
+        return src_part
+
+    # allocate a new name with incremented number
+    m = re.match(r'(.+?)(\d+)(\.\w+)$', src_part)
+    if m:
+        prefix, _, ext = m.groups()
+        n = _max_num(tgt.parts, re.escape(prefix) + r'(\d+)' + re.escape(ext)) + 1
+        tgt_part = f'{prefix}{n}{ext}'
+    elif src_part in tgt.parts:
+        base, ext = os.path.splitext(src_part)
+        n = 1
+        while f'{base}_{n}{ext}' in tgt.parts:
+            n += 1
+        tgt_part = f'{base}_{n}{ext}'
     else:
-        # fallback: use libreoffice to export as images directly
-        # this works but pdftoppm gives better quality
+        tgt_part = src_part
+
+    tgt.parts[tgt_part] = src.parts[src_part]
+
+    # register early to prevent infinite recursion from circular rels
+    ctx.generic[src_part] = tgt_part
+
+    _copy_content_type(tgt, src, src_part, tgt_part)
+    _copy_simple_rels(ctx, tgt, src, src_part, tgt_part)
+
+    return tgt_part
+
+
+def _copy_simple_rels(ctx, tgt, src, src_part, tgt_part):
+    """Copy relationships for a part, handling media and generic sub-parts."""
+    src_rels = src.get_rels(src_part)
+    if src_rels is None:
+        return
+
+    new_rels = etree.Element(f'{{{_PKG_RELS}}}Relationships')
+    for rel in src_rels:
+        rtype = rel.get('Type')
+
+        if rel.get('TargetMode') == 'External':
+            new_rels.append(deepcopy(rel))
+            continue
+
+        src_abs = _resolve(src_part, rel.get('Target'))
+        r = deepcopy(rel)
+
+        if rtype in _MEDIA_TYPES and src_abs in src.parts:
+            r.set('Target', _relpath(tgt_part, _copy_media(ctx, tgt, src, src_abs)))
+        elif src_abs in src.parts:
+            r.set('Target', _relpath(tgt_part, _copy_generic(ctx, tgt, src, src_abs)))
+
+        new_rels.append(r)
+
+    tgt.set_rels(tgt_part, new_rels)
+
+
+def _copy_theme(ctx, tgt, src, src_part):
+    """Copy a theme part (and any media it references) to target."""
+    if src_part in ctx.themes:
+        return ctx.themes[src_part]
+    if src_part not in src.parts:
+        return src_part
+
+    n = _max_num(tgt.parts, r'ppt/theme/theme(\d+)\.xml') + 1
+    tgt_part = f'ppt/theme/theme{n}.xml'
+    tgt.parts[tgt_part] = src.parts[src_part]
+
+    ctx.themes[src_part] = tgt_part
+
+    _copy_simple_rels(ctx, tgt, src, src_part, tgt_part)
+    _add_override(tgt, tgt_part, _CT_THEME)
+
+    return tgt_part
+
+
+def _copy_layout_for_master(ctx, tgt, src, src_part, tgt_master):
+    """Copy a layout as part of copying its parent master (no master recursion)."""
+    if src_part in ctx.layouts:
+        return ctx.layouts[src_part]
+    if src_part not in src.parts:
+        return src_part
+
+    n = _max_num(tgt.parts, r'ppt/slideLayouts/slideLayout(\d+)\.xml') + 1
+    tgt_part = f'ppt/slideLayouts/slideLayout{n}.xml'
+    tgt.parts[tgt_part] = src.parts[src_part]
+    ctx.layouts[src_part] = tgt_part
+
+    src_rels = src.get_rels(src_part)
+    if src_rels is not None:
+        new_rels = etree.Element(f'{{{_PKG_RELS}}}Relationships')
+        for rel in src_rels:
+            rtype = rel.get('Type')
+            if rel.get('TargetMode') == 'External':
+                new_rels.append(deepcopy(rel))
+                continue
+            src_abs = _resolve(src_part, rel.get('Target'))
+            r = deepcopy(rel)
+            if rtype == _RT_MASTER and tgt_master:
+                r.set('Target', _relpath(tgt_part, tgt_master))
+            elif rtype in _MEDIA_TYPES and src_abs in src.parts:
+                r.set('Target', _relpath(tgt_part, _copy_media(ctx, tgt, src, src_abs)))
+            elif src_abs in src.parts:
+                r.set('Target', _relpath(tgt_part, _copy_generic(ctx, tgt, src, src_abs)))
+            new_rels.append(r)
+        tgt.set_rels(tgt_part, new_rels)
+
+    _add_override(tgt, tgt_part, _CT_LAYOUT)
+    return tgt_part
+
+
+def _max_layout_id(pkg):
+    """Find the maximum sldLayoutId 'id' across all masters in the package."""
+    max_id = 2147483648
+    for name in pkg.parts:
+        if (name.startswith('ppt/slideMasters/') and name.endswith('.xml')
+                and '/_rels/' not in name):
+            try:
+                root = pkg.xml(name)
+            except Exception:
+                continue
+            for entry in root.iter(f'{{{_NS_P}}}sldLayoutId'):
+                try:
+                    max_id = max(max_id, int(entry.get('id', 0)))
+                except (ValueError, TypeError):
+                    pass
+    return max_id
+
+
+def _copy_master(ctx, tgt, src, src_part, pres_xml, pres_rels):
+    """Copy a slide master, all its layouts, theme, and media to target.
+
+    Copies every layout the master references so the master's
+    sldLayoutIdLst stays consistent. Layout IDs are reassigned
+    to be globally unique.
+    """
+    if src_part in ctx.masters:
+        return ctx.masters[src_part]
+    if src_part not in src.parts:
+        return src_part
+
+    # copy the master's theme first
+    theme_info = src.find_rel(src_part, _RT_THEME)
+    tgt_theme = _copy_theme(ctx, tgt, src, theme_info[1]) if theme_info else None
+
+    # allocate new master name
+    n = _max_num(tgt.parts, r'ppt/slideMasters/slideMaster(\d+)\.xml') + 1
+    tgt_part = f'ppt/slideMasters/slideMaster{n}.xml'
+    tgt.parts[tgt_part] = src.parts[src_part]
+
+    # register early to prevent re-entry
+    ctx.masters[src_part] = tgt_part
+
+    # rebuild master rels: copy ALL layouts, remap theme + media
+    # preserving original rIds so the master XML body stays consistent
+    src_rels = src.get_rels(src_part)
+    if src_rels is not None:
+        new_rels = etree.Element(f'{{{_PKG_RELS}}}Relationships')
+        for rel in src_rels:
+            rtype = rel.get('Type')
+
+            if rel.get('TargetMode') == 'External':
+                new_rels.append(deepcopy(rel))
+                continue
+
+            src_abs = _resolve(src_part, rel.get('Target'))
+            r = deepcopy(rel)
+
+            if rtype == _RT_LAYOUT:
+                tgt_layout = _copy_layout_for_master(ctx, tgt, src, src_abs, tgt_part)
+                r.set('Target', _relpath(tgt_part, tgt_layout))
+            elif rtype == _RT_THEME and tgt_theme:
+                r.set('Target', _relpath(tgt_part, tgt_theme))
+            elif rtype in _MEDIA_TYPES and src_abs in src.parts:
+                r.set('Target', _relpath(tgt_part, _copy_media(ctx, tgt, src, src_abs)))
+            elif src_abs in src.parts:
+                r.set('Target', _relpath(tgt_part, _copy_generic(ctx, tgt, src, src_abs)))
+
+            new_rels.append(r)
+
+        tgt.set_rels(tgt_part, new_rels)
+
+    # reassign sldLayoutId 'id' values to be globally unique
+    max_lid = _max_layout_id(tgt)
+    master_xml = tgt.xml(tgt_part)
+    for entry in master_xml.iter(f'{{{_NS_P}}}sldLayoutId'):
+        max_lid += 1
+        entry.set('id', str(max_lid))
+    tgt.set_xml(tgt_part, master_xml)
+
+    _add_override(tgt, tgt_part, _CT_MASTER)
+
+    # add master reference to presentation.xml
+    master_list = pres_xml.find(f'{{{_NS_P}}}sldMasterIdLst')
+    if master_list is None:
+        sld_list = pres_xml.find(f'{{{_NS_P}}}sldIdLst')
+        idx = list(pres_xml).index(sld_list) if sld_list is not None else 0
+        master_list = etree.Element(f'{{{_NS_P}}}sldMasterIdLst')
+        pres_xml.insert(idx, master_list)
+
+    max_mid = 2147483647
+    for elem in master_list:
+        max_mid = max(max_mid, int(elem.get('id', 0)))
+
+    rid = f'rId{_next_rid(pres_rels)}'
+    etree.SubElement(pres_rels, f'{{{_PKG_RELS}}}Relationship',
+                     Id=rid, Type=_RT_MASTER,
+                     Target=f'slideMasters/slideMaster{n}.xml')
+
+    me = etree.SubElement(master_list, f'{{{_NS_P}}}sldMasterId')
+    me.set('id', str(max_mid + 1))
+    me.set(f'{{{_NS_R}}}id', rid)
+
+    return tgt_part
+
+
+def _copy_layout(ctx, tgt, src, src_part, pres_xml, pres_rels):
+    """Copy a slide layout and its master+theme chain to target.
+
+    _copy_master copies ALL of a master's layouts, so after calling it
+    the requested layout will normally already be in ctx.layouts.
+    """
+    if src_part in ctx.layouts:
+        return ctx.layouts[src_part]
+    if src_part not in src.parts:
+        return src_part
+
+    # copying the master will also copy all its layouts (including this one)
+    master_info = src.find_rel(src_part, _RT_MASTER)
+    if master_info:
+        _copy_master(ctx, tgt, src, master_info[1], pres_xml, pres_rels)
+
+    # master should have copied this layout already
+    if src_part in ctx.layouts:
+        return ctx.layouts[src_part]
+
+    # fallback: layout without a master (unusual) — copy directly
+    tgt_master = ctx.masters.get(master_info[1]) if master_info else None
+    return _copy_layout_for_master(ctx, tgt, src, src_part, tgt_master)
+
+
+def _copy_notes(ctx, tgt, src, src_part, tgt_slide_part):
+    """Copy a notes slide to target, updating its slide back-reference."""
+    if src_part in ctx.notes:
+        return ctx.notes[src_part]
+    if src_part not in src.parts:
+        return src_part
+
+    n = _max_num(tgt.parts, r'ppt/notesSlides/notesSlide(\d+)\.xml') + 1
+    tgt_part = f'ppt/notesSlides/notesSlide{n}.xml'
+    tgt.parts[tgt_part] = src.parts[src_part]
+
+    ctx.notes[src_part] = tgt_part
+
+    # rebuild notes rels: update slide back-ref, remap media, handle notesMaster
+    src_rels = src.get_rels(src_part)
+    if src_rels is not None:
+        new_rels = etree.Element(f'{{{_PKG_RELS}}}Relationships')
+        for rel in src_rels:
+            rtype = rel.get('Type')
+
+            if rel.get('TargetMode') == 'External':
+                new_rels.append(deepcopy(rel))
+                continue
+
+            src_abs = _resolve(src_part, rel.get('Target'))
+            r = deepcopy(rel)
+
+            if rtype == _RT_SLIDE:
+                # update to point to the new slide
+                r.set('Target', _relpath(tgt_part, tgt_slide_part))
+            elif rtype == _RT_NOTES_MASTER:
+                # point to target's notesMaster (keep path if it exists in target)
+                if src_abs in tgt.parts:
+                    r.set('Target', _relpath(tgt_part, src_abs))
+                else:
+                    # find any notesMaster in target
+                    nm = [k for k in tgt.parts
+                          if k.startswith('ppt/notesMasters/')
+                          and k.endswith('.xml')
+                          and '/_rels/' not in k]
+                    if nm:
+                        r.set('Target', _relpath(tgt_part, nm[0]))
+                    else:
+                        continue  # drop ref if no notesMaster available
+            elif rtype in _MEDIA_TYPES and src_abs in src.parts:
+                r.set('Target', _relpath(tgt_part, _copy_media(ctx, tgt, src, src_abs)))
+            elif src_abs in src.parts:
+                r.set('Target', _relpath(tgt_part, _copy_generic(ctx, tgt, src, src_abs)))
+
+            new_rels.append(r)
+
+        tgt.set_rels(tgt_part, new_rels)
+
+    _add_override(tgt, tgt_part, _CT_NOTES)
+
+    return tgt_part
+
+
+# main merge logic
+
+def _merge_source_into(tgt, src, label):
+    """Merge all slides from a source package into the target package."""
+    ctx = _MergeCtx()
+
+    # parse source presentation to find its slides
+    src_pres = src.xml('ppt/presentation.xml')
+    src_pres_rels = src.get_rels('ppt/presentation.xml')
+    if src_pres_rels is None:
+        print(f'  [!] no presentation rels in {label}', file=sys.stderr)
+        return 0
+
+    # build rId -> (type, resolved_target) map for source
+    src_rel_map = {}
+    for rel in src_pres_rels:
+        if rel.get('TargetMode') != 'External':
+            src_rel_map[rel.get('Id')] = (
+                rel.get('Type'),
+                _resolve('ppt/presentation.xml', rel.get('Target'))
+            )
+
+    # enumerate source slides
+    sld_list = src_pres.find(f'{{{_NS_P}}}sldIdLst')
+    if sld_list is None:
+        print(f'  [!] no slides in {label}', file=sys.stderr)
+        return 0
+
+    src_slides = []
+    for sld_id_elem in sld_list.findall(f'{{{_NS_P}}}sldId'):
+        rid = sld_id_elem.get(f'{{{_NS_R}}}id')
+        if rid in src_rel_map and src_rel_map[rid][0] == _RT_SLIDE:
+            src_slides.append((sld_id_elem.get('id'), rid, src_rel_map[rid][1]))
+
+    if not src_slides:
+        print(f'  [!] no slides in {label}', file=sys.stderr)
+        return 0
+
+    # load target presentation state
+    tgt_pres = tgt.xml('ppt/presentation.xml')
+    tgt_pres_rels = tgt.get_rels('ppt/presentation.xml')
+    if tgt_pres_rels is None:
+        tgt_pres_rels = etree.Element(f'{{{_PKG_RELS}}}Relationships')
+
+    tgt_sld_list = tgt_pres.find(f'{{{_NS_P}}}sldIdLst')
+    if tgt_sld_list is None:
+        tgt_sld_list = etree.SubElement(tgt_pres, f'{{{_NS_P}}}sldIdLst')
+
+    # find max slide ID in target (must be >= 256 per OOXML spec)
+    max_sld_id = 256
+    for elem in tgt_sld_list.findall(f'{{{_NS_P}}}sldId'):
+        max_sld_id = max(max_sld_id, int(elem.get('id', 0)))
+
+    # copy each slide
+    count = 0
+    for _, _, src_slide_part in src_slides:
+        if src_slide_part not in src.parts:
+            print(f'  [!] slide part missing: {src_slide_part}', file=sys.stderr)
+            continue
+
+        # allocate new slide name in target
+        sn = _max_num(tgt.parts, r'ppt/slides/slide(\d+)\.xml') + 1
+        tgt_slide = f'ppt/slides/slide{sn}.xml'
+        tgt.parts[tgt_slide] = src.parts[src_slide_part]
+
+        # rebuild slide rels: remap layout, notes, media, and other parts
+        src_slide_rels = src.get_rels(src_slide_part)
+        if src_slide_rels is not None:
+            new_slide_rels = etree.Element(f'{{{_PKG_RELS}}}Relationships')
+            for rel in src_slide_rels:
+                rtype = rel.get('Type')
+
+                if rel.get('TargetMode') == 'External':
+                    new_slide_rels.append(deepcopy(rel))
+                    continue
+
+                src_abs = _resolve(src_slide_part, rel.get('Target'))
+                r = deepcopy(rel)
+
+                if rtype == _RT_LAYOUT:
+                    tgt_layout = _copy_layout(ctx, tgt, src, src_abs, tgt_pres, tgt_pres_rels)
+                    r.set('Target', _relpath(tgt_slide, tgt_layout))
+                elif rtype == _RT_NOTES:
+                    tgt_notes = _copy_notes(ctx, tgt, src, src_abs, tgt_slide)
+                    r.set('Target', _relpath(tgt_slide, tgt_notes))
+                elif rtype in _MEDIA_TYPES and src_abs in src.parts:
+                    r.set('Target', _relpath(tgt_slide, _copy_media(ctx, tgt, src, src_abs)))
+                elif src_abs in src.parts:
+                    r.set('Target', _relpath(tgt_slide, _copy_generic(ctx, tgt, src, src_abs)))
+
+                new_slide_rels.append(r)
+
+            tgt.set_rels(tgt_slide, new_slide_rels)
+
+        # register slide in presentation.xml
+        max_sld_id += 1
+        rid = f'rId{_next_rid(tgt_pres_rels)}'
+        etree.SubElement(tgt_pres_rels, f'{{{_PKG_RELS}}}Relationship',
+                         Id=rid, Type=_RT_SLIDE,
+                         Target=f'slides/slide{sn}.xml')
+
+        se = etree.SubElement(tgt_sld_list, f'{{{_NS_P}}}sldId')
+        se.set('id', str(max_sld_id))
+        se.set(f'{{{_NS_R}}}id', rid)
+
+        _add_override(tgt, tgt_slide, _CT_SLIDE)
+        count += 1
+
+    # persist updated presentation.xml and rels
+    tgt.set_xml('ppt/presentation.xml', tgt_pres)
+    tgt.set_rels('ppt/presentation.xml', tgt_pres_rels)
+
+    return count
+
+
+def _lo_normalize(pptx_path):
+    """Re-save a PPTX through LibreOffice to fix any OOXML spec issues.
+
+    LibreOffice reads the file and writes a clean, fully-compliant PPTX.
+    This eliminates intermittent "repair" prompts in Microsoft PowerPoint
+    caused by subtle structural issues (element ordering, stale refs, etc.).
+    """
+    if not shutil.which('libreoffice'):
+        print('  [!] libreoffice not found, skipping normalization', file=sys.stderr)
+        return
+
+    tmpdir = tempfile.mkdtemp(prefix='kjandoc_norm_')
+    try:
+        abs_path = os.path.abspath(pptx_path)
         subprocess.run([
-            'libreoffice', '--headless', '--convert-to', 'png',
-            '--outdir', output_dir, pdf_path
+            'libreoffice', '--headless', '--convert-to', 'pptx',
+            '--outdir', tmpdir, abs_path
         ], check=True, capture_output=True)
 
-    # collect and sort image files
-    images = sorted(glob.glob(os.path.join(output_dir, 'slide-*.png')))
-    if not images:
-        images = sorted(glob.glob(os.path.join(output_dir, '*.png')))
+        # libreoffice writes to tmpdir with the same stem
+        normalized = os.path.join(tmpdir, os.path.basename(abs_path))
+        if os.path.exists(normalized):
+            shutil.move(normalized, abs_path)
+        else:
+            # sometimes libreoffice changes the extension casing
+            for f in os.listdir(tmpdir):
+                if f.lower().endswith('.pptx'):
+                    shutil.move(os.path.join(tmpdir, f), abs_path)
+                    break
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
-    if not images:
-        raise RuntimeError("no slide images produced")
 
-    return images
+def merge_presentations(input_files, output_path):
+    if not input_files:
+        raise ValueError('no input files')
 
-
-def images_to_pptx(image_groups, output_path, slide_width_emu=9144000, slide_height_emu=6858000):
-    # build a pptx from slide images, one image per slide filling the entire area.
-    prs = Presentation()
-    prs.slide_width = slide_width_emu
-    prs.slide_height = slide_height_emu
-
-    # use blank layout (index 6 is typically blank)
-    blank_layout = None
-    for layout in prs.slide_layouts:
-        if layout.name == 'Blank':
-            blank_layout = layout
-            break
-    if blank_layout is None:
-        blank_layout = prs.slide_layouts[6] if len(prs.slide_layouts) > 6 else prs.slide_layouts[0]
+    print(f'[*] base: {Path(input_files[0]).name}')
+    tgt = _Pkg(input_files[0])
 
     total = 0
-    for label, images in image_groups:
-        for img_path in images:
-            slide = prs.slides.add_slide(blank_layout)
+    for pptx_path in input_files[1:]:
+        label = Path(pptx_path).name
+        print(f'[*] merging: {label}')
+        src = _Pkg(pptx_path)
+        count = _merge_source_into(tgt, src, label)
+        print(f'  -> {count} slides merged')
+        total += count
 
-            # remove any placeholder shapes from blank layout
-            for ph in list(slide.placeholders):
-                sp = ph._element
-                sp.getparent().remove(sp)
+    tgt.save(output_path)
 
-            # add image covering the full slide
-            slide.shapes.add_picture(
-                img_path,
-                left=0,
-                top=0,
-                width=slide_width_emu,
-                height=slide_height_emu
-            )
-            total += 1
-        print(f"  [{label}] {len(images)} slides added")
+    # normalize through libreoffice to ensure full OOXML compliance
+    print(f'[*] normalizing...')
+    _lo_normalize(output_path)
 
-    prs.save(output_path)
-    return total
+    # count slides in first file for the total
+    base = _Pkg(input_files[0])
+    base_pres = base.xml('ppt/presentation.xml')
+    base_sld_list = base_pres.find(f'{{{_NS_P}}}sldIdLst')
+    base_count = len(base_sld_list) if base_sld_list is not None else 0
+    total += base_count
 
-
-def merge_presentations(*pptx_files, output='merged.pptx'):
-    # merge pptx files with zero formatting loss via image rendering.
-    if not pptx_files:
-        raise ValueError("no files provided")
-
-    image_groups = []
-
-    for pptx_file in pptx_files:
-        label = Path(pptx_file).stem
-        print(f"[*] rendering: {label}")
-
-        tmpdir = tempfile.mkdtemp(prefix=f'pptx_merge_{label}_')
-        try:
-            images = pptx_to_images(pptx_file, tmpdir)
-            image_groups.append((label, images))
-            print(f"  -> {len(images)} slides rendered at {DPI} DPI")
-        except Exception as e:
-            print(f"  [!] error rendering {label}: {e}", file=sys.stderr)
-            raise
-
-    # get slide dimensions from first presentation
-    first_prs = Presentation(pptx_files[0])
-    sw = first_prs.slide_width
-    sh = first_prs.slide_height
-
-    print(f"[*] building merged presentation...")
-    total = images_to_pptx(image_groups, output, sw, sh)
-    print(f"[+] merged {total} slides from {len(pptx_files)} presentations -> {output}")
-
-    # cleanup temp dirs
-    for label, images in image_groups:
-        if images:
-            tmpdir = os.path.dirname(images[0])
-            shutil.rmtree(tmpdir, ignore_errors=True)
-
-    return output
+    print(f'[+] merged {total} slides from {len(input_files)} presentations -> {output_path}')
+    return output_path
 
 
-if __name__ == "__main__":
-    import argparse
-    
+# CLI
+
+if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='merge pptx files with perfect formatting preservation via rendering',
-        usage='%(prog)s input1.pptx [input2.pptx ...] -o output.pptx'
+        description='merge PPTX presentations preserving full editability',
+        usage='%(prog)s input1.pptx [input2.pptx ...] -o output.pptx',
     )
     parser.add_argument(
-        'inputs',
-        metavar='INPUT',
-        nargs='+',
-        help='input pptx files to merge'
+        'inputs', metavar='INPUT', nargs='+',
+        help='input PPTX files to merge',
     )
     parser.add_argument(
-        '-o', '--output',
-        default='merged.pptx',
-        help='output filename (default: merged.pptx)'
+        '-o', '--output', default='merged.pptx',
+        help='output filename (default: merged.pptx)',
     )
-    parser.add_argument(
-        '--dpi',
-        type=int,
-        default=DPI,
-        help=f'rendering DPI for slide images (default: {DPI})'
-    )
-    
     args = parser.parse_args()
-    
-    # validate input files exist
+
     for f in args.inputs:
         if not os.path.exists(f):
-            print(f"[!] error: file not found: {f}", file=sys.stderr)
+            print(f'[!] error: file not found: {f}', file=sys.stderr)
             sys.exit(1)
         if not f.lower().endswith('.pptx'):
-            print(f"[!] error: not a pptx file: {f}", file=sys.stderr)
+            print(f'[!] error: not a pptx file: {f}', file=sys.stderr)
             sys.exit(1)
-    
-    # update global DPI if specified
-    if args.dpi != DPI:
-        globals()['DPI'] = args.dpi
-    
-    merge_presentations(*args.inputs, output=args.output)
+
+    merge_presentations(args.inputs, args.output)
