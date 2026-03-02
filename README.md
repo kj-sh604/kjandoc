@@ -1,6 +1,6 @@
 # kjandoc
 
-> i needed something to combine multiple `.pptx` files, i couldn't believe `pandoc` can't do that, so here's a creative but probably useless attempt at it.
+> i needed something to combine multiple `.pptx` files, i couldn't believe `pandoc` can't do that, so here's a creative attempt at it using OOXML manipulation to do it.
 
 https://github.com/user-attachments/assets/915940ab-f6a5-4e6f-b8dc-62de81d35c62
 
