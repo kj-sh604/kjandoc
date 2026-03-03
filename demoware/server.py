@@ -56,8 +56,6 @@ app = FastAPI(
         "  -F \"files=@deck_a.pptx\" \\\n"
         "  -F \"files=@deck_b.pptx\" \\\n"
         "  -o merged.pptx\n"
-        "```\n\n"
-        "source: [kj-sh604/kjandoc](https://github.com/kj-sh604/kjandoc)"
     ),
     version="2026.03.03",
     docs_url="/api/docs",
