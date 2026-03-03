@@ -168,11 +168,7 @@ RUN apt-get update && \
 # python deps
 COPY src/requirements.txt /tmp/requirements.txt
 RUN pip3 install --no-cache-dir --no-compile --break-system-packages -r /tmp/requirements.txt && \
-    pip3 install --no-cache-dir --no-compile --break-system-packages --ignore-installed setuptools>=78.1.1 wheel>=0.46.2 && \
-    apt-get remove --autoremove --purge -y python3-setuptools python3-wheel software-properties-common && \
-    apt-get autoremove -y && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/*
+    pip3 install --no-cache-dir --no-compile --break-system-packages --ignore-installed setuptools>=78.1.1 wheel>=0.46.2
 
 # kjandoc binary -> /usr/local/bin
 COPY src/kjandoc /usr/local/bin/kjandoc
@@ -181,6 +177,11 @@ RUN chmod +x /usr/local/bin/kjandoc
 # demoware
 WORKDIR /app
 COPY demoware/ /app/
+RUN pip3 install --no-cache-dir --no-compile --break-system-packages -r /app/requirements.txt && \
+    apt-get remove --autoremove --purge -y python3-setuptools python3-wheel software-properties-common && \
+    apt-get autoremove -y && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 # storage dirs
 RUN mkdir -p /app/uploads /app/output
