@@ -46,10 +46,10 @@ app = FastAPI(
     summary="merge multiple .pptx presentations into one",
     description=(
         "kjandoc merges PowerPoint (.pptx) files while preserving full "
-        "editability — layouts, masters, themes, media, and notes are all "
-        "carried over.\n\n"
+        "editability; layouts, masters, themes, media, and notes are all "
+        "carried over as best as possible.\n\n"
         "### usage\n\n"
-        "Upload two or more `.pptx` files via `POST /api` (multipart form) "
+        "upload two or more `.pptx` files via `POST /api` (multipart form) "
         "and receive the merged presentation as a direct download.\n\n"
         "```bash\n"
         "curl -X POST http://localhost:8080/api \\\n"
@@ -57,7 +57,7 @@ app = FastAPI(
         "  -F \"files=@deck_b.pptx\" \\\n"
         "  -o merged.pptx\n"
         "```\n\n"
-        "source: [github.com/kj-sh604/kjandoc](https://github.com/kj-sh604/kjandoc)"
+        "source: [kj-sh604/kjandoc](https://github.com/kj-sh604/kjandoc)"
     ),
     version="2026.03.03",
     docs_url="/api/docs",
@@ -211,12 +211,12 @@ async def api_merge(
         ),
     ),
 ):
-    """Upload two or more .pptx files and receive the merged presentation.
+    """upload two or more .pptx files and receive the merged presentation.
 
-    Files are merged in the order they appear in the multipart request.
+    files are merged in the order they appear in the multipart request.
     The response is the merged `.pptx` returned directly as a binary download.
 
-    The optional `filename` query parameter controls the `Content-Disposition`
+    the optional `filename` query parameter controls the `Content-Disposition`
     filename of the returned file.  When omitted, a name in the form
     `{unix-epoch}-{uid}.pptx` is generated automatically.
     """
