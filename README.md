@@ -2,12 +2,6 @@
 
 > i needed something to combine multiple `.pptx` files, i couldn't believe `pandoc` can't do that, so here's a creative attempt using OOXML manipulation to do it.
 
-https://github.com/user-attachments/assets/915940ab-f6a5-4e6f-b8dc-62de81d35c62
-
-https://github.com/user-attachments/assets/c7fe58c1-ff76-41bf-977b-870247a6a3e2
-
-
-
 ## what it does
 - merges multiple .pptx files into one
 - preserves full editability, with 99% fidelity to the original formatting (some minor quirks may occur)
